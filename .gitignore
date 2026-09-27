@@ -1,0 +1,39 @@
+# Rust
+/target/
+
+# Build / installer output
+/dist/
+
+# Local scratch / temporary work
+/.scratch/
+
+# Agent / AI tooling state
+/.agents/
+/.claude/
+AGENTS.md
+/docs/
+/agents/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Logs / temporary files
+*.log
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
