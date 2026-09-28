@@ -110,26 +110,21 @@ impl MotionPath {
 
     pub fn sample(&self, elapsed: Duration) -> Point {
         let seconds = elapsed.as_secs_f64();
-        let phase = TAU * self.speed * seconds / 60.0;
+        let phase = TAU * self.speed * seconds / 3.0;
         let (x, y) = match self.profile {
             Profile::Linear => (self.amplitude * phase.sin(), 0.0),
             Profile::Diagonal => {
-                let shuttle = (1.0 - phase.cos()) / 2.0;
-                if self.amplitude < SQRT_2 {
-                    let travel = if self.amplitude >= 1.0 {
-                        if seconds > 0.0 && (seconds * self.speed / 3.0).fract() < 0.5 {
-                            self.amplitude
-                        } else {
-                            0.0
-                        }
+                let shuttle = if (1.0..SQRT_2).contains(&self.amplitude) {
+                    if seconds > 0.0 && (seconds * self.speed / 3.0).fract() < 0.5 {
+                        1.0
                     } else {
-                        self.amplitude * shuttle
-                    };
-                    (0.0, -travel)
+                        0.0
+                    }
                 } else {
-                    let diagonal = -self.amplitude * shuttle / SQRT_2;
-                    (diagonal, diagonal)
-                }
+                    (1.0 - phase.cos()) / 2.0
+                };
+                let diagonal = -self.amplitude * shuttle / SQRT_2;
+                (diagonal, diagonal)
             }
             Profile::Lissajous => (
                 self.amplitude * phase.sin() / SQRT_2,
@@ -357,16 +352,36 @@ mod tests {
     fn diagonal_retraces_between_reference_and_upper_left() {
         let path = MotionPath::new(Settings::default(), point(), 1);
         let start = path.sample(Duration::ZERO);
-        let corner = path.sample(Duration::from_secs(10));
-        let end = path.sample(Duration::from_secs(20));
+        let corner = path.sample(Duration::from_millis(500));
+        let end = path.sample(Duration::from_secs(1));
         assert_eq!(start, point());
         assert!(corner.x < point().x && corner.y < point().y);
         assert_eq!(end, point());
-        assert!(path.sample(Duration::from_secs(15)).x > corner.x);
+        assert!(path.sample(Duration::from_millis(750)).x > corner.x);
     }
 
     #[test]
-    fn one_pixel_diagonal_repeats_up_and_back_without_long_stops() {
+    fn one_pixel_linear_moves_right_and_left_each_second() {
+        let path = MotionPath::new(
+            Settings {
+                profile: Profile::Linear,
+                amplitude: 1.0,
+                ..Settings::default()
+            },
+            point(),
+            1,
+        );
+        assert_eq!(path.sample(Duration::ZERO), point());
+        assert_eq!(path.sample(Duration::from_millis(250)).x.round(), 101.0);
+        assert_eq!(path.sample(Duration::from_millis(500)).x.round(), 100.0);
+        assert_eq!(path.sample(Duration::from_millis(750)).x.round(), 99.0);
+        assert_eq!(path.sample(Duration::from_millis(1_000)).x.round(), 100.0);
+        assert_eq!(path.sample(Duration::from_millis(1_250)).x.round(), 101.0);
+        assert_eq!(path.sample(Duration::from_millis(1_250)).y, 100.0);
+    }
+
+    #[test]
+    fn one_pixel_diagonal_repeats_upper_left_and_back_without_long_stops() {
         let path = MotionPath::new(
             Settings {
                 amplitude: 1.0,
@@ -376,20 +391,13 @@ mod tests {
             1,
         );
         assert_eq!(path.sample(Duration::ZERO), point());
-        assert_eq!(
-            path.sample(Duration::from_millis(16)),
-            Point { x: 100.0, y: 99.0 }
-        );
-        assert_eq!(
-            path.sample(Duration::from_millis(250)),
-            Point { x: 100.0, y: 99.0 }
-        );
+        let corner = path.sample(Duration::from_millis(16));
+        assert_eq!(corner.x.round(), 99.0);
+        assert_eq!(corner.y.round(), 99.0);
+        assert_eq!(path.sample(Duration::from_millis(250)), corner);
         assert_eq!(path.sample(Duration::from_millis(500)), point());
         assert_eq!(path.sample(Duration::from_millis(750)), point());
-        assert_eq!(
-            path.sample(Duration::from_millis(1_016)),
-            Point { x: 100.0, y: 99.0 }
-        );
+        assert_eq!(path.sample(Duration::from_millis(1_016)), corner);
         assert_eq!(path.sample(Duration::from_millis(1_500)), point());
 
         let faster = MotionPath::new(
@@ -402,10 +410,7 @@ mod tests {
             1,
         );
         assert_eq!(faster.sample(Duration::from_millis(250)), point());
-        assert_eq!(
-            faster.sample(Duration::from_millis(516)),
-            Point { x: 100.0, y: 99.0 }
-        );
+        assert_eq!(faster.sample(Duration::from_millis(516)), corner);
     }
 
     #[test]
