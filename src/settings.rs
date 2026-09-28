@@ -107,8 +107,18 @@ fn parse(contents: &str) -> Option<Settings> {
         match key {
             "profile" => settings.profile = parse_profile(value)?,
             "delay_seconds" => settings.delay = Duration::from_secs(value.parse().ok()?),
-            "amplitude_pixels" => settings.amplitude = value.parse().ok()?,
-            "speed" => settings.speed = value.parse().ok()?,
+            "amplitude_pixels" => {
+                settings.amplitude = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())?
+            }
+            "speed" => {
+                settings.speed = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())?
+            }
             "start_with_windows" => settings.start_with_windows = value.parse().ok()?,
             _ => return None,
         }
@@ -180,6 +190,18 @@ mod tests {
         let store = SettingsStore::new(&path);
         assert_eq!(
             store.load().expect("corrupt settings are recoverable"),
+            Settings::default()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_finite_settings_file_falls_back_to_defaults() {
+        let path = temporary_path();
+        fs::write(&path, "amplitude_pixels=NaN\n").expect("test file should write");
+        let store = SettingsStore::new(&path);
+        assert_eq!(
+            store.load().expect("invalid values are recoverable"),
             Settings::default()
         );
         let _ = fs::remove_file(path);

@@ -27,3 +27,16 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Run]
 Filename: "{app}\wiggler.exe"; Description: "Launch Wiggler"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  StartupCommand: String;
+begin
+  if CurUninstallStep = usUninstall then
+    if RegQueryStringValue(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run', 'Wiggler', StartupCommand) then
+      if Lowercase(StartupCommand) = Lowercase(ExpandConstant('"{app}\wiggler.exe"')) then
+        RegDeleteValue(HKEY_CURRENT_USER,
+          'Software\Microsoft\Windows\CurrentVersion\Run', 'Wiggler');
+end;

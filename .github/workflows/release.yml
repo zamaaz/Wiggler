@@ -1,0 +1,68 @@
+name: Windows build and release
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release executable
+        run: cargo build --release --locked
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $compiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $compiler) {
+            $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            throw 'Inno Setup compiler is unavailable on the Windows runner.'
+          }
+          & $compiler installer\wiggler.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload installer for tagged releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wiggler-Windows-installer
+          path: dist/Wiggler-Setup-v1.0.0.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Wiggler-Windows-installer
+          path: release
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=release/Wiggler-Setup-v1.0.0.exe
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --title "Wiggler $GITHUB_REF_NAME" --notes "Release candidate installer. Physical input and Windows lifecycle acceptance checks remain open." --prerelease
+          else
+            gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --title "Wiggler $GITHUB_REF_NAME" --generate-notes
+          fi

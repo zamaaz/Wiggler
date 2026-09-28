@@ -1,4 +1,4 @@
-use std::f64::consts::TAU;
+use std::f64::consts::{SQRT_2, TAU};
 use std::time::{Duration, Instant};
 
 const MIN_DELAY_SECONDS: u64 = 1;
@@ -49,10 +49,17 @@ impl Settings {
                     .as_secs()
                     .clamp(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS),
             ),
-            amplitude: self
-                .amplitude
-                .clamp(MIN_AMPLITUDE_PIXELS, MAX_AMPLITUDE_PIXELS),
-            speed: self.speed.clamp(MIN_SPEED, MAX_SPEED),
+            amplitude: if self.amplitude.is_finite() {
+                self.amplitude
+                    .clamp(MIN_AMPLITUDE_PIXELS, MAX_AMPLITUDE_PIXELS)
+            } else {
+                DEFAULT_AMPLITUDE_PIXELS
+            },
+            speed: if self.speed.is_finite() {
+                self.speed.clamp(MIN_SPEED, MAX_SPEED)
+            } else {
+                DEFAULT_SPEED
+            },
             start_with_windows: self.start_with_windows,
         }
     }
@@ -108,18 +115,22 @@ impl MotionPath {
             Profile::Linear => (self.amplitude * phase.sin(), 0.0),
             Profile::Diagonal => {
                 let shuttle = (1.0 - phase.cos()) / 2.0;
-                (-self.amplitude * shuttle, -self.amplitude * shuttle)
+                let diagonal = -self.amplitude * shuttle / SQRT_2;
+                (diagonal, diagonal)
             }
             Profile::Lissajous => (
-                self.amplitude * phase.sin(),
-                self.amplitude * (1.5 * phase).sin(),
+                self.amplitude * phase.sin() / SQRT_2,
+                self.amplitude * (1.5 * phase + 0.15 * (seconds / 300.0).sin()).sin() / SQRT_2,
             ),
             Profile::Brownian => {
                 let x = self.noise(seconds * self.speed / 8.0, self.seed);
                 let y = self.noise(seconds * self.speed / 8.0, self.seed.rotate_left(32));
-                let radius = (x * x + y * y).sqrt();
-                let scale = if radius > 1.0 { 1.0 / radius } else { 1.0 };
-                (self.amplitude * x * scale, self.amplitude * y * scale)
+                let fade = (seconds * 2.0).clamp(0.0, 1.0);
+                let fade = fade * fade * (3.0 - 2.0 * fade);
+                (
+                    self.amplitude * x * fade / SQRT_2,
+                    self.amplitude * y * fade / SQRT_2,
+                )
             }
         };
         self.reference.offset(x, y)
@@ -150,8 +161,9 @@ fn seeded_value(index: i64, seed: u64) -> f64 {
 pub struct Runtime {
     settings: Settings,
     mode: RuntimeMode,
-    idle_deadline: Option<Instant>,
+    last_activity: Instant,
     path: Option<MotionPath>,
+    path_started: Option<Instant>,
     next_seed: u64,
 }
 
@@ -161,8 +173,9 @@ impl Runtime {
         Self {
             settings,
             mode: RuntimeMode::UserControl,
-            idle_deadline: Some(now + settings.delay),
+            last_activity: now,
             path: None,
+            path_started: None,
             next_seed: 1,
         }
     }
@@ -175,31 +188,48 @@ impl Runtime {
         self.settings
     }
 
+    pub fn resting_point(&self) -> Option<Point> {
+        self.path.map(|path| path.reference)
+    }
+
     pub fn update_settings(&mut self, settings: Settings, now: Instant) {
-        self.settings = settings.validated();
-        self.mode = RuntimeMode::UserControl;
-        self.path = None;
-        self.idle_deadline = Some(now + self.settings.delay);
+        let settings = settings.validated();
+        let motion_changed = self.settings.profile != settings.profile
+            || self.settings.amplitude != settings.amplitude
+            || self.settings.speed != settings.speed;
+        if motion_changed && self.mode == RuntimeMode::Wiggling {
+            let current = self.path.expect("wiggling runtime has a path").sample(
+                now - self
+                    .path_started
+                    .expect("wiggling runtime has a start time"),
+            );
+            self.path = Some(MotionPath::new(settings, current, self.next_seed));
+            self.path_started = Some(now);
+            self.next_seed = self.next_seed.wrapping_add(1);
+        }
+        self.settings = settings;
     }
 
     pub fn on_mouse_activity(&mut self, now: Instant) {
         if self.mode != RuntimeMode::Paused {
             self.mode = RuntimeMode::UserControl;
             self.path = None;
-            self.idle_deadline = Some(now + self.settings.delay);
+            self.path_started = None;
+            self.last_activity = now;
         }
     }
 
     pub fn pause(&mut self) {
         self.mode = RuntimeMode::Paused;
         self.path = None;
-        self.idle_deadline = None;
+        self.path_started = None;
     }
 
     pub fn resume(&mut self, now: Instant) {
         self.mode = RuntimeMode::UserControl;
         self.path = None;
-        self.idle_deadline = Some(now + self.settings.delay);
+        self.path_started = None;
+        self.last_activity = now;
     }
 
     pub fn tick(&mut self, now: Instant, cursor: Point) -> Option<Point> {
@@ -207,17 +237,18 @@ impl Runtime {
             return None;
         }
         if self.mode == RuntimeMode::UserControl {
-            if now < self.idle_deadline.expect("active runtime has a deadline") {
+            if now < self.last_activity + self.settings.delay {
                 return None;
             }
             self.mode = RuntimeMode::Wiggling;
             self.path = Some(MotionPath::new(self.settings, cursor, self.next_seed));
+            self.path_started = Some(now);
             self.next_seed = self.next_seed.wrapping_add(1);
         }
         Some(
             self.path.expect("wiggling runtime has a path").sample(
                 now - self
-                    .idle_deadline
+                    .path_started
                     .expect("wiggling runtime has a start time"),
             ),
         )
@@ -254,6 +285,18 @@ mod tests {
         assert_eq!(settings.delay, Duration::from_secs(1));
         assert_eq!(settings.amplitude, 0.0);
         assert_eq!(settings.speed, 20.0);
+    }
+
+    #[test]
+    fn non_finite_settings_fall_back_to_defaults() {
+        let settings = Settings {
+            amplitude: f64::NAN,
+            speed: f64::INFINITY,
+            ..Settings::default()
+        }
+        .validated();
+        assert_eq!(settings.amplitude, Settings::default().amplitude);
+        assert_eq!(settings.speed, Settings::default().speed);
     }
 
     #[test]
@@ -310,6 +353,54 @@ mod tests {
     }
 
     #[test]
+    fn brownian_starts_at_the_resting_point() {
+        let path = MotionPath::new(
+            Settings {
+                profile: Profile::Brownian,
+                ..Settings::default()
+            },
+            point(),
+            42,
+        );
+        assert_eq!(path.sample(Duration::ZERO), point());
+    }
+
+    #[test]
+    fn changing_motion_settings_does_not_restart_the_idle_delay() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(Settings::default(), now);
+        runtime.tick(now + Duration::from_secs(5), point());
+        runtime.update_settings(
+            Settings {
+                speed: 4.0,
+                ..Settings::default()
+            },
+            now + Duration::from_secs(6),
+        );
+        assert_eq!(runtime.mode(), RuntimeMode::Wiggling);
+        assert!(runtime
+            .tick(now + Duration::from_secs(6), point())
+            .is_some());
+    }
+
+    #[test]
+    fn changing_delay_uses_the_last_genuine_activity_time() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(Settings::default(), now);
+        runtime.update_settings(
+            Settings {
+                delay: Duration::from_secs(10),
+                ..Settings::default()
+            },
+            now + Duration::from_secs(4),
+        );
+        assert_eq!(runtime.tick(now + Duration::from_secs(9), point()), None);
+        assert!(runtime
+            .tick(now + Duration::from_secs(10), point())
+            .is_some());
+    }
+
+    #[test]
     fn all_profiles_are_bounded_around_the_reference() {
         for profile in [
             Profile::Linear,
@@ -325,8 +416,8 @@ mod tests {
             let path = MotionPath::new(settings, point(), 42);
             for step in 0..600 {
                 let sample = path.sample(Duration::from_millis(step * 100));
-                assert!((sample.x - 100.0).abs() <= 5.0 + f64::EPSILON);
-                assert!((sample.y - 100.0).abs() <= 5.0 + f64::EPSILON);
+                let distance = ((sample.x - 100.0).powi(2) + (sample.y - 100.0).powi(2)).sqrt();
+                assert!(distance <= 5.0 + 1e-10, "{profile:?}: {distance}");
             }
         }
     }

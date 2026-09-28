@@ -1,6 +1,5 @@
 use std::ffi::c_void;
 use std::io;
-use std::path::PathBuf;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::System::Registry::{
@@ -14,7 +13,7 @@ const VALUE_NAME: &str = "Wiggler";
 pub fn set_enabled(enabled: bool) -> io::Result<()> {
     if enabled {
         let key = open_key(KEY_READ | KEY_WRITE)?;
-        let command = command_line();
+        let command = command_line()?;
         let bytes = encode_wide(&command);
         let result = unsafe {
             RegSetValueExW(
@@ -45,7 +44,7 @@ pub fn set_enabled(enabled: bool) -> io::Result<()> {
 }
 
 pub fn repair() -> io::Result<()> {
-    let expected = command_line();
+    let expected = command_line()?;
     let key = open_key(KEY_READ | KEY_WRITE)?;
     let mut buffer = [0u16; 1024];
     let mut bytes = (buffer.len() * 2) as u32;
@@ -93,9 +92,8 @@ fn open_key(access: u32) -> io::Result<HKEY> {
     result_to_io(result).map(|_| key)
 }
 
-fn command_line() -> String {
-    let path: PathBuf = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("Wiggler.exe"));
-    format!("\"{}\"", path.display())
+fn command_line() -> io::Result<String> {
+    Ok(format!("\"{}\"", std::env::current_exe()?.display()))
 }
 
 fn encode_wide(value: &str) -> Vec<u16> {

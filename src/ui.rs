@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -10,9 +11,13 @@ use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetStockObject, GetSysColorBrush, SetBkMode, UpdateWindow, DEFAULT_GUI_FONT, HDC, TRANSPARENT,
+    CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, UpdateWindow, DEFAULT_CHARSET,
+    FW_NORMAL, HDC, HFONT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -25,6 +30,8 @@ use wiggler::core::{Profile, Settings};
 use wiggler::settings::SettingsStore;
 
 const WM_TRAY: u32 = WM_APP + 1;
+const SUSPEND_SLEEP: u32 = 1;
+const SUSPEND_LOCK: u32 = 2;
 const TRAY_ID: u32 = 1;
 const MENU_SETTINGS: u16 = 100;
 const MENU_PAUSE: u16 = 101;
@@ -40,6 +47,8 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 pub struct TrayUi {
     thread: thread::JoinHandle<()>,
+    window: isize,
+    control: Arc<ControlState>,
 }
 
 struct UiContext {
@@ -47,7 +56,7 @@ struct UiContext {
     store: SettingsStore,
     tray_window: HWND,
     settings_window: HWND,
-    // font: HFONT,
+    font: HFONT,
     labels: [HWND; 4],
     profile: HWND,
     delay: HWND,
@@ -57,24 +66,51 @@ struct UiContext {
     pixels: HWND,
     startup: HWND,
     pause: HWND,
+    save_error_shown: bool,
 }
 
 impl TrayUi {
     pub fn start(control: Arc<ControlState>, store: SettingsStore) -> Result<Self, String> {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread_control = Arc::clone(&control);
+        let owner_control = Arc::clone(&control);
         let thread = thread::spawn(move || {
-            if let Err(error) = run_ui(control, store) {
+            if let Err(error) = run_ui(control, store, &ready_tx) {
+                thread_control.exit.store(true, Ordering::Release);
+                let _ = ready_tx.send(Err(error.clone()));
                 eprintln!("tray stopped: {error}");
             }
         });
-        Ok(Self { thread })
+        match ready_rx.recv() {
+            Ok(Ok(window)) => Ok(Self {
+                thread,
+                window,
+                control: owner_control,
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err("tray thread exited before it was ready".to_string())
+            }
+        }
     }
 
     pub fn join(self) {
+        if !self.control.exit.load(Ordering::Acquire) && !self.thread.is_finished() {
+            unsafe { PostMessageW(self.window as HWND, WM_CLOSE, 0, 0) };
+        }
         let _ = self.thread.join();
     }
 }
 
-fn run_ui(control: Arc<ControlState>, store: SettingsStore) -> Result<(), String> {
+fn run_ui(
+    control: Arc<ControlState>,
+    store: SettingsStore,
+    ready: &SyncSender<Result<isize, String>>,
+) -> Result<(), String> {
     let instance = unsafe { GetModuleHandleW(null()) };
     if instance.is_null() {
         return Err(last_error("GetModuleHandleW"));
@@ -99,7 +135,7 @@ fn run_ui(control: Arc<ControlState>, store: SettingsStore) -> Result<(), String
         hInstance: instance,
         lpszClassName: settings_class_name.as_ptr(),
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-        hIcon: unsafe { LoadIconW(instance, 1 as *const u16) },
+        hIcon: unsafe { LoadIconW(instance, std::ptr::without_provenance::<u16>(1)) },
         hbrBackground: (5 + 1) as _,
         ..unsafe { std::mem::zeroed() }
     };
@@ -110,7 +146,7 @@ fn run_ui(control: Arc<ControlState>, store: SettingsStore) -> Result<(), String
         store,
         tray_window: null_mut(),
         settings_window: null_mut(),
-        // font: null_mut(),
+        font: null_mut(),
         labels: [null_mut(); 4],
         profile: null_mut(),
         delay: null_mut(),
@@ -120,6 +156,7 @@ fn run_ui(control: Arc<ControlState>, store: SettingsStore) -> Result<(), String
         pixels: null_mut(),
         startup: null_mut(),
         pause: null_mut(),
+        save_error_shown: false,
     });
     let context_ptr = context.as_mut() as *mut UiContext;
     let title = wide("Wiggler");
@@ -147,9 +184,19 @@ fn run_ui(control: Arc<ControlState>, store: SettingsStore) -> Result<(), String
         Ordering::Release,
     );
     context.tray_window = window;
-    if let Err(error) = add_tray_icon(window) {
+    if unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) } == 0 {
+        let error = last_error("WTSRegisterSessionNotification");
+        unsafe { DestroyWindow(window) };
         return Err(error);
     }
+    if let Err(error) = add_tray_icon(window) {
+        unsafe {
+            WTSUnRegisterSessionNotification(window);
+            DestroyWindow(window);
+        }
+        return Err(error);
+    }
+    let _ = ready.send(Ok(window as isize));
     let mut message = unsafe { std::mem::zeroed() };
     loop {
         let result = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
@@ -162,11 +209,9 @@ fn run_ui(control: Arc<ControlState>, store: SettingsStore) -> Result<(), String
         }
     }
     unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &mut notify_data(window));
+        Shell_NotifyIconW(NIM_DELETE, &notify_data(window));
+        WTSUnRegisterSessionNotification(window);
         DestroyWindow(window);
-    }
-    unsafe {
-        drop(Box::from_raw(context_ptr));
     }
     Ok(())
 }
@@ -194,7 +239,10 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND as usize => {
-            context.control.suspended.store(true, Ordering::Release);
+            context
+                .control
+                .suspended
+                .fetch_or(SUSPEND_SLEEP, Ordering::AcqRel);
             context
                 .control
                 .lifecycle_generation
@@ -202,12 +250,37 @@ unsafe extern "system" fn window_proc(
             1
         }
         WM_POWERBROADCAST if wparam == PBT_APMRESUMEAUTOMATIC as usize => {
-            context.control.suspended.store(false, Ordering::Release);
+            context
+                .control
+                .suspended
+                .fetch_and(!SUSPEND_SLEEP, Ordering::AcqRel);
             context
                 .control
                 .lifecycle_generation
                 .fetch_add(1, Ordering::AcqRel);
             1
+        }
+        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK as usize => {
+            context
+                .control
+                .suspended
+                .fetch_or(SUSPEND_LOCK, Ordering::AcqRel);
+            context
+                .control
+                .lifecycle_generation
+                .fetch_add(1, Ordering::AcqRel);
+            0
+        }
+        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK as usize => {
+            context
+                .control
+                .suspended
+                .fetch_and(!SUSPEND_LOCK, Ordering::AcqRel);
+            context
+                .control
+                .lifecycle_generation
+                .fetch_add(1, Ordering::AcqRel);
+            0
         }
         WM_DISPLAYCHANGE | WM_DEVICECHANGE | WM_SETTINGCHANGE => {
             context
@@ -261,11 +334,25 @@ unsafe fn handle_command(context: &mut UiContext, command: u16) -> LRESULT {
             DestroyWindow(context.tray_window);
         }
         MENU_REPAIR_STARTUP => {
-            let _ = startup::repair();
+            let enabled = context
+                .control
+                .settings
+                .lock()
+                .map(|settings| settings.start_with_windows)
+                .unwrap_or(false);
+            let result = if enabled {
+                startup::repair()
+            } else {
+                startup::set_enabled(false)
+            };
+            if let Err(error) = result {
+                show_error(
+                    context.tray_window,
+                    &format!("Could not repair startup: {error}"),
+                );
+            }
         }
-        ID_PROFILE | ID_DELAY | ID_AMPLITUDE | ID_SPEED | ID_STARTUP => {
-            update_settings(context, true)
-        }
+        ID_PROFILE | ID_DELAY | ID_AMPLITUDE | ID_SPEED | ID_STARTUP => update_settings(context),
         _ => {}
     }
     0
@@ -372,19 +459,23 @@ unsafe fn show_settings(context: &mut UiContext) {
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        s(580),
-        s(350),
+        s(640),
+        s(370),
         context.tray_window,
         null_mut(),
         instance,
         context as *mut UiContext as *const c_void,
     );
+    if window.is_null() {
+        show_error(context.tray_window, &last_error("CreateWindowExW"));
+        return;
+    }
     context.settings_window = window;
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
 }
 
-unsafe fn update_settings(context: &mut UiContext, save_to_disk: bool) {
+unsafe fn update_settings(context: &mut UiContext) {
     if context.settings_window.is_null() {
         return;
     }
@@ -400,7 +491,7 @@ unsafe fn update_settings(context: &mut UiContext, save_to_disk: bool) {
         3 => Profile::Brownian,
         _ => current.profile,
     };
-    let settings = Settings {
+    let mut settings = Settings {
         profile,
         delay: std::time::Duration::from_secs(
             read_u64(context.delay).unwrap_or(current.delay.as_secs()),
@@ -412,14 +503,70 @@ unsafe fn update_settings(context: &mut UiContext, save_to_disk: bool) {
     }
     .validated();
 
+    let startup_changed = settings.start_with_windows != current.start_with_windows;
+    if startup_changed {
+        if let Err(error) = startup::set_enabled(settings.start_with_windows) {
+            settings.start_with_windows = current.start_with_windows;
+            SendMessageW(
+                context.startup,
+                BM_SETCHECK,
+                if current.start_with_windows {
+                    BST_CHECKED as usize
+                } else {
+                    BST_UNCHECKED as usize
+                },
+                0,
+            );
+            show_error(
+                context.settings_window,
+                &format!("Could not change Start with Windows: {error}"),
+            );
+        }
+    }
+
+    if settings == current {
+        return;
+    }
+    if let Err(error) = context.store.save(settings) {
+        if startup_changed {
+            let _ = startup::set_enabled(current.start_with_windows);
+            SendMessageW(
+                context.startup,
+                BM_SETCHECK,
+                if current.start_with_windows {
+                    BST_CHECKED as usize
+                } else {
+                    BST_UNCHECKED as usize
+                },
+                0,
+            );
+        }
+        if !context.save_error_shown {
+            context.save_error_shown = true;
+            show_error(
+                context.settings_window,
+                &format!("Settings could not be saved: {error}"),
+            );
+        }
+        return;
+    }
+    context.save_error_shown = false;
     if let Ok(mut value) = context.control.settings.lock() {
         *value = settings;
     }
-    let _ = startup::set_enabled(settings.start_with_windows);
+}
 
-    if save_to_disk {
-        let _ = context.store.save(settings);
-    }
+unsafe fn show_error(window: HWND, message: &str) {
+    MessageBoxW(
+        window,
+        wide(message).as_ptr(),
+        wide("Wiggler").as_ptr(),
+        MB_ICONERROR | MB_OK,
+    );
+}
+
+pub fn show_fatal_error(message: &str) {
+    unsafe { show_error(null_mut(), message) }
 }
 
 unsafe extern "system" fn settings_proc(
@@ -442,6 +589,21 @@ unsafe extern "system" fn settings_proc(
     }
     let context = &mut *context;
     match message {
+        WM_DPICHANGED => {
+            let suggested = &*(lparam as *const RECT);
+            SetWindowPos(
+                window,
+                null_mut(),
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            set_settings_font(window, context);
+            layout_settings_controls(window, context);
+            0
+        }
         WM_SIZE => {
             layout_settings_controls(window, context);
             0
@@ -463,18 +625,24 @@ unsafe extern "system" fn settings_proc(
                 || notification == CBN_SELCHANGE
                 || notification == BN_CLICKED
             {
-                update_settings(context, false);
+                update_settings(context);
             }
             0
         }
         WM_CLOSE => {
-            update_settings(context, true);
             DestroyWindow(window);
             0
         }
         WM_DESTROY => {
             context.settings_window = null_mut();
             0
+        }
+        WM_NCDESTROY => {
+            if !context.font.is_null() {
+                DeleteObject(context.font);
+                context.font = null_mut();
+            }
+            DefWindowProcW(window, message, wparam, lparam)
         }
         _ => DefWindowProcW(window, message, wparam, lparam),
     }
@@ -542,10 +710,6 @@ unsafe fn create_settings_controls(window: HWND, context: &mut UiContext) {
     context.delay = numeric_edit(
         window,
         ID_DELAY as i32,
-        0,
-        0,
-        0,
-        0,
         settings.delay.as_secs().to_string(),
         instance,
     );
@@ -567,10 +731,6 @@ unsafe fn create_settings_controls(window: HWND, context: &mut UiContext) {
     context.amplitude = numeric_edit(
         window,
         ID_AMPLITUDE as i32,
-        0,
-        0,
-        0,
-        0,
         settings.amplitude.to_string(),
         instance,
     );
@@ -592,10 +752,6 @@ unsafe fn create_settings_controls(window: HWND, context: &mut UiContext) {
     context.speed = numeric_edit(
         window,
         ID_SPEED as i32,
-        0,
-        0,
-        0,
-        0,
         settings.speed.to_string(),
         instance,
     );
@@ -641,13 +797,40 @@ unsafe fn create_settings_controls(window: HWND, context: &mut UiContext) {
         null(),
     );
 
+    set_settings_font(window, context);
     layout_settings_controls(window, context);
-    let system_font = GetStockObject(DEFAULT_GUI_FONT);
-    EnumChildWindows(window, Some(set_system_font), system_font as LPARAM);
     refresh_pause_button(context);
 }
 
-unsafe extern "system" fn set_system_font(hwnd: HWND, font: LPARAM) -> i32 {
+unsafe fn set_settings_font(window: HWND, context: &mut UiContext) {
+    let dpi = GetDpiForWindow(window).max(96) as i32;
+    let font = CreateFontW(
+        -(20 * dpi / 96),
+        0,
+        0,
+        0,
+        FW_NORMAL as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        0,
+        0,
+        0,
+        0,
+        wide("Segoe UI").as_ptr(),
+    );
+    if font.is_null() {
+        return;
+    }
+    EnumChildWindows(window, Some(apply_settings_font), font as LPARAM);
+    if !context.font.is_null() {
+        DeleteObject(context.font);
+    }
+    context.font = font;
+}
+
+unsafe extern "system" fn apply_settings_font(hwnd: HWND, font: LPARAM) -> i32 {
     SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1);
     1
 }
@@ -667,27 +850,27 @@ unsafe fn layout_settings_controls(window: HWND, context: &UiContext) {
     let fields_top = action_top + scale(54);
     let footer_height = scale(42);
     let row_gap = ((height - fields_top - footer_height) / 4).max(scale(40));
-    let label_width = scale(140);
-    let unit_width = scale(58);
+    let label_width = scale(190);
+    let unit_width = scale(70);
     let input_left = content_left + label_width + scale(14);
     let input_width =
         (content_width - label_width - scale(14) - unit_width - scale(8)).max(scale(120));
-    let input_height = scale(24);
+    let input_height = scale(34);
 
     MoveWindow(
         context.pause,
         content_left,
         action_top,
-        scale(130),
-        scale(30),
+        scale(170),
+        scale(42),
         1,
     );
     MoveWindow(
         context.startup,
-        content_left + scale(150),
+        content_left + scale(190),
         action_top,
-        scale(220),
-        scale(30),
+        scale(260),
+        scale(42),
         1,
     );
 
@@ -724,25 +907,16 @@ unsafe fn layout_settings_controls(window: HWND, context: &UiContext) {
     );
 }
 
-unsafe fn numeric_edit(
-    window: HWND,
-    id: i32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    value: String,
-    instance: HINSTANCE,
-) -> HWND {
+unsafe fn numeric_edit(window: HWND, id: i32, value: String, instance: HINSTANCE) -> HWND {
     let edit = CreateWindowExW(
         WS_EX_CLIENTEDGE,
         wide("EDIT").as_ptr(),
         wide(&value).as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        x,
-        y,
-        w,
-        h,
+        0,
+        0,
+        0,
+        0,
         window,
         id as _,
         instance,
@@ -763,7 +937,10 @@ unsafe fn read_u64(window: HWND) -> Option<u64> {
     read_text(window)?.parse().ok()
 }
 unsafe fn read_f64(window: HWND) -> Option<f64> {
-    read_text(window)?.parse().ok()
+    read_text(window)?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 fn profile_index(profile: Profile) -> usize {
@@ -782,7 +959,12 @@ fn notify_data(window: HWND) -> NOTIFYICONDATAW {
     data.uID = TRAY_ID;
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
-    data.hIcon = unsafe { LoadIconW(GetModuleHandleW(null()), 1 as *const u16) };
+    data.hIcon = unsafe {
+        LoadIconW(
+            GetModuleHandleW(null()),
+            std::ptr::without_provenance::<u16>(1),
+        )
+    };
     let tip = wide("Wiggler");
     let count = tip.len().min(data.szTip.len() - 1);
     data.szTip[..count].copy_from_slice(&tip[..count]);
@@ -790,8 +972,8 @@ fn notify_data(window: HWND) -> NOTIFYICONDATAW {
 }
 
 fn add_tray_icon(window: HWND) -> Result<(), String> {
-    let mut data = notify_data(window);
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) } == 0 {
+    let data = notify_data(window);
+    if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
         return Err(last_error("Shell_NotifyIconW"));
     }
     Ok(())
