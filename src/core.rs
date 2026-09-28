@@ -112,7 +112,7 @@ impl MotionPath {
         let seconds = elapsed.as_secs_f64();
         let phase = TAU * self.speed * seconds / 3.0;
         let (x, y) = match self.profile {
-            Profile::Linear => (self.amplitude * phase.sin(), 0.0),
+            Profile::Linear => (-self.amplitude * (1.0 - phase.cos()) / 2.0, 0.0),
             Profile::Diagonal => {
                 let shuttle = if (1.0..SQRT_2).contains(&self.amplitude) {
                     if seconds > 0.0 && (seconds * self.speed / 3.0).fract() < 0.5 {
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn one_pixel_linear_moves_right_and_left_each_second() {
+    fn one_pixel_linear_moves_left_and_back_each_second() {
         let path = MotionPath::new(
             Settings {
                 profile: Profile::Linear,
@@ -372,12 +372,19 @@ mod tests {
             1,
         );
         assert_eq!(path.sample(Duration::ZERO), point());
-        assert_eq!(path.sample(Duration::from_millis(250)).x.round(), 101.0);
-        assert_eq!(path.sample(Duration::from_millis(500)).x.round(), 100.0);
-        assert_eq!(path.sample(Duration::from_millis(750)).x.round(), 99.0);
+        assert!(path.sample(Duration::from_millis(250)).x < 100.0);
+        assert_eq!(path.sample(Duration::from_millis(500)).x, 99.0);
+        assert!(path.sample(Duration::from_millis(750)).x < 100.0);
         assert_eq!(path.sample(Duration::from_millis(1_000)).x.round(), 100.0);
-        assert_eq!(path.sample(Duration::from_millis(1_250)).x.round(), 101.0);
+        assert_eq!(path.sample(Duration::from_millis(1_500)).x, 99.0);
         assert_eq!(path.sample(Duration::from_millis(1_250)).y, 100.0);
+        for step in 0..300 {
+            let x = path.sample(Duration::from_millis(step * 10)).x;
+            assert!(
+                (99.0..=100.0).contains(&x),
+                "Linear crossed right of rest: {x}"
+            );
+        }
     }
 
     #[test]
