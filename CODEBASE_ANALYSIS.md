@@ -14,7 +14,7 @@ The baseline build was **not ready to call v1.0.0 complete**: normal shutdown ha
 | --- | --- | --- |
 | Shutdown and startup | Removed the UI double free; the tray and hook now report readiness; the hook thread joins before its event closes. | Repeated rapid shutdown with real mouse activity has not been stress-tested. |
 | Input safety | The runtime stops injection when hook readiness is lost, rechecks genuine activity immediately before injection, and requires the hook to acknowledge injected movement; a missing acknowledgement triggers hook reset. | A physical event that arrives during `SendInput` can still race with that call. Windows can silently remove a low-level hook; acknowledgement limits an unnoticed loss to the first attempted motion but cannot prove the hook alive before that attempt. Real mouse and touchpad timing must be measured. |
-| Motion | Brownian starts at rest; Lissajous has slow phase drift; every profile stays within radial amplitude. A near-edge diagonal shuttle redirects inward instead of becoming motionless, while the other paths reflect at monitor edges. | A live negative-coordinate corner and Pause/Resume test passes; mixed-DPI, all-profile edge, and monitor-change behavior need further checks. |
+| Motion | Brownian starts at rest; Lissajous has slow phase drift; every profile stays within radial amplitude. A near-edge diagonal shuttle redirects inward instead of becoming motionless, while the other paths reflect at monitor edges. At one-pixel amplitude, Diagonal steps one pixel up on its first motion frame and returns on the configured cycle. | A live negative-coordinate corner and Pause/Resume test passes; mixed-DPI, all-profile edge, and monitor-change behavior need further checks. |
 | Settings and startup | Valid edits save immediately; non-finite values are rejected; motion settings update without restarting the delay; startup writes are checked and failed toggles revert; disabled repair remains disabled. A settings read error now stops launch visibly without changing startup registration. | Registry-denied error presentation and an interrupted settings write have not been fault-injected. |
 | Lifecycle and resources | Lock/unlock notifications, sleep state, hook reset, a blocking hook message loop, and settings-window DPI resizing are in place; transient cursor and injection failures recover without ending the process. The settings window now uses a larger DPI-aware font and roomier controls. | Lock/unlock, sleep/wake, Explorer restart, reboot startup, live DPI changes, CPU use, and long-running resource stability need observation. |
 | Installer | Clean install, upgrade, Start Menu entry, uninstall registration, startup cleanup, and settings retention were exercised. | An update while Wiggler itself is running has not been tested. |
@@ -25,7 +25,7 @@ The installer remains installed locally after validation, with Wiggler stopped a
 
 | Area | Files | Current responsibility |
 | --- | --- | --- |
-| Pure behavior | `src/core.rs` | Settings bounds, runtime states, and four movement paths; eleven unit tests |
+| Pure behavior | `src/core.rs` | Settings bounds, runtime states, and four movement paths; twelve unit tests |
 | Persistence | `src/settings.rs` | Local text settings with temporary-file replacement; four unit tests |
 | Windows input | `src/native.rs` | Single-instance mutex, mouse hook, runtime loop, and `SendInput` |
 | Windows shell | `src/ui.rs` | Tray, settings window, lifecycle messages, and settings edits |
@@ -94,7 +94,7 @@ The source references in this section point to the pre-change code and are prese
 | 3 | Verify settings and startup failure handling. | Immediate persistence and startup toggle pass installed smoke tests. | Fault-inject a denied Run-key write and settings-file write; confirm the UI reports failure and retains accurate state. |
 | 4 | Validate all profiles and monitor boundaries. | Pure radial and edge tests pass; a live diagonal test at a negative-coordinate corner passes. | Inspect the other three profiles at edges, mixed DPI, and monitor changes. |
 | 5 | Exercise Windows lifecycle and installation. | Clean install, upgrade while stopped, normal exit, and uninstall pass. | Check lock/unlock, sleep/wake, Explorer restart, update while running, and login startup on the installed build. |
-| 6 | Close the release gate. | Formatting, Clippy, 17 tests, optimized build, installer compilation, and visual inspection pass. | Record the remaining PRD checklist outcomes and a resource soak; fix any failures before calling v1.0.0 complete. |
+| 6 | Close the release gate. | Formatting, Clippy, 18 tests, optimized build, installer compilation, and visual inspection pass. | Record the remaining PRD checklist outcomes and a resource soak; fix any failures before calling v1.0.0 complete. |
 
 Keep each step small enough to inspect. Avoid broad refactoring until the failure paths and acceptance tests identify a real seam. Prefer one explicit owner for each Win32 handle and a single source of truth for each state.
 
@@ -123,7 +123,7 @@ The release gate is the PRD's definition of done. The installed smoke tests esta
 
 | Scenario | Current evidence | Needed evidence |
 | --- | --- | --- |
-| Idle delay, pause, simple bounds | Eleven core tests, two native edge tests, and live motion plus Pause/Resume | Other profile visual checks |
+| Idle delay, pause, simple bounds | Twelve core tests, two native edge tests, and live motion plus Pause/Resume | Other profile visual checks |
 | Persistent settings | Four file tests and installed immediate-edit smoke test | Denied write and interrupted write |
 | Input isolation and override | Injected-flag source check, acknowledgement recovery, and live motion | Real mouse, touchpad, wheel, and handoff timing |
 | Recovery | Lock/sleep handlers and transient native-call retry | Lock/unlock, sleep/wake, hook loss, Explorer restart, display changes |
@@ -135,7 +135,7 @@ The release gate is the PRD's definition of done. The installed smoke tests esta
 The Windows build used Rust/Cargo 1.98.1, Visual Studio Build Tools 2022 with the MSVC C++ workload, and Inno Setup 6.7.3. The executable was built in the MSVC developer environment. On 2026-09-28:
 
 - `cargo fmt --all` completed, and `cargo clippy --all-targets --locked -- -D warnings` passed.
-- `cargo test --locked` passed all 17 tests: 11 core, four settings, and two Windows monitor-edge tests.
+- `cargo test --locked` passed all 18 tests: 12 core, four settings, and two Windows monitor-edge tests.
 - `cargo build --release --locked` and `ISCC installer\wiggler.iss` succeeded.
 - A clean silent install created the executable, Start Menu shortcut, and Windows uninstall entry. An upgrade while the app was stopped succeeded.
 - The installed app created its tray window, rejected a second instance, saved a delay edit before settings closed, applied and removed Start with Windows, kept Repair Startup disabled when startup was off, kept running after settings closed, and exited normally.
@@ -144,7 +144,7 @@ The Windows build used Rust/Cargo 1.98.1, Visual Studio Build Tools 2022 with th
 - Silent uninstall removed the executable, Start Menu shortcut, and matching HKCU Run entry, while retaining a settings file. The test settings file and Run entry were then cleaned up. The final build was reinstalled and is currently stopped.
 - The installed settings window was captured at physical DPI size and visually inspected: profile, delay, amplitude, speed, units, startup checkbox, and native close button were visible without clipping.
 
-After the installed smoke run, a small pass fixed settings-read failure handling and added a `WM_DPICHANGED` settings-window resize. Following user feedback that the font was too small, the settings controls now use a 20-pixel-at-96-DPI Segoe UI font, scaled with window DPI. The window, labels, fields, and buttons have more room. The rebuilt app was installed, and a read-only screenshot of the actual settings window was inspected: text and units are legible with no clipping. The existing user settings file was preserved. Formatting, strict Clippy, all 17 tests, the optimized build, and installer compilation passed again. The rebuilt installer is `dist/Wiggler-Setup-v1.0.0.exe` (SHA-256 `E3C3D840D37BBE46BE09BDEC28AD08D36E085EB2772820CC534C2DF730F7CB42`). The release executable is `target/release/wiggler.exe` (SHA-256 `8D57383B8C26E5E7CF5F972ECE7A8EACE92FE616E898C6319C5B19DA67448B5F`). Generated binaries remain ignored by Git. Rust, MSVC Build Tools, and Inno Setup were installed on this machine for verification.
+After the installed smoke run, a small pass fixed settings-read failure handling and added a `WM_DPICHANGED` settings-window resize. Following user feedback that the font was too small, the settings controls now use a 20-pixel-at-96-DPI Segoe UI font, scaled with window DPI. The window, labels, fields, and buttons have more room. The rebuilt app was installed, and a read-only screenshot of the actual settings window was inspected: text and units are legible with no clipping. A later report that one-pixel motion seemed inactive led to a focused failing test: the Diagonal endpoint was 0.71 pixel on each axis. At one-pixel amplitude, Diagonal now moves one full pixel vertically on its first motion frame and returns on the configured cycle; larger amplitudes retain the upper-left diagonal path. The installed app was updated and the existing settings file was preserved. A live pointer sample was inconclusive because the cursor moved hundreds of pixels independently of Wiggler during sampling. Formatting, strict Clippy, all 18 tests, the optimized build, and installer compilation pass. The latest installer is `dist/Wiggler-Setup-v1.0.0.exe` (SHA-256 `59D47A9252E386B79B918C34D350937224247E452DD7A92EED6A32081AE3A8C1`). The release executable is `target/release/wiggler.exe` (SHA-256 `59F0C8904A7D91AF307CE2D23E77071CB2F4819C080322CAC010B64F761FAFD6`). Generated binaries remain ignored by Git. Rust, MSVC Build Tools, and Inno Setup were installed on this machine for verification.
 
 To reproduce the build, open an MSVC x64 developer shell in this checkout and run `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, and `cargo build --release --locked`, then compile `installer\wiggler.iss` with Inno Setup 6 (`ISCC.exe`). Install the resulting setup executable for the remaining physical-device and Windows lifecycle acceptance checks.
 

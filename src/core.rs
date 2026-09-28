@@ -115,8 +115,21 @@ impl MotionPath {
             Profile::Linear => (self.amplitude * phase.sin(), 0.0),
             Profile::Diagonal => {
                 let shuttle = (1.0 - phase.cos()) / 2.0;
-                let diagonal = -self.amplitude * shuttle / SQRT_2;
-                (diagonal, diagonal)
+                if self.amplitude < SQRT_2 {
+                    let travel = if self.amplitude >= 1.0 {
+                        if seconds > 0.0 && (seconds * self.speed / 60.0).fract() < 0.5 {
+                            self.amplitude
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        self.amplitude * shuttle
+                    };
+                    (0.0, -travel)
+                } else {
+                    let diagonal = -self.amplitude * shuttle / SQRT_2;
+                    (diagonal, diagonal)
+                }
             }
             Profile::Lissajous => (
                 self.amplitude * phase.sin() / SQRT_2,
@@ -350,6 +363,33 @@ mod tests {
         assert!(corner.x < point().x && corner.y < point().y);
         assert_eq!(end, point());
         assert!(path.sample(Duration::from_secs(15)).x > corner.x);
+    }
+
+    #[test]
+    fn one_pixel_diagonal_moves_up_one_pixel_then_returns() {
+        let path = MotionPath::new(
+            Settings {
+                amplitude: 1.0,
+                ..Settings::default()
+            },
+            point(),
+            1,
+        );
+        assert_eq!(path.sample(Duration::ZERO), point());
+        assert_eq!(
+            path.sample(Duration::from_millis(16)),
+            Point { x: 100.0, y: 99.0 }
+        );
+        assert_eq!(
+            path.sample(Duration::from_secs(9)),
+            Point { x: 100.0, y: 99.0 }
+        );
+        assert_eq!(path.sample(Duration::from_secs(10)), point());
+        assert_eq!(path.sample(Duration::from_secs(19)), point());
+        assert_eq!(
+            path.sample(Duration::from_millis(20_016)),
+            Point { x: 100.0, y: 99.0 }
+        );
     }
 
     #[test]
