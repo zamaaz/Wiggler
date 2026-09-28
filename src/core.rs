@@ -117,7 +117,7 @@ impl MotionPath {
                 let shuttle = (1.0 - phase.cos()) / 2.0;
                 if self.amplitude < SQRT_2 {
                     let travel = if self.amplitude >= 1.0 {
-                        if seconds > 0.0 && (seconds * self.speed / 60.0).fract() < 0.5 {
+                        if seconds > 0.0 && (seconds * self.speed / 3.0).fract() < 0.5 {
                             self.amplitude
                         } else {
                             0.0
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn one_pixel_diagonal_moves_up_one_pixel_then_returns() {
+    fn one_pixel_diagonal_repeats_up_and_back_without_long_stops() {
         let path = MotionPath::new(
             Settings {
                 amplitude: 1.0,
@@ -381,13 +381,29 @@ mod tests {
             Point { x: 100.0, y: 99.0 }
         );
         assert_eq!(
-            path.sample(Duration::from_secs(9)),
+            path.sample(Duration::from_millis(250)),
             Point { x: 100.0, y: 99.0 }
         );
-        assert_eq!(path.sample(Duration::from_secs(10)), point());
-        assert_eq!(path.sample(Duration::from_secs(19)), point());
+        assert_eq!(path.sample(Duration::from_millis(500)), point());
+        assert_eq!(path.sample(Duration::from_millis(750)), point());
         assert_eq!(
-            path.sample(Duration::from_millis(20_016)),
+            path.sample(Duration::from_millis(1_016)),
+            Point { x: 100.0, y: 99.0 }
+        );
+        assert_eq!(path.sample(Duration::from_millis(1_500)), point());
+
+        let faster = MotionPath::new(
+            Settings {
+                amplitude: 1.0,
+                speed: 6.0,
+                ..Settings::default()
+            },
+            point(),
+            1,
+        );
+        assert_eq!(faster.sample(Duration::from_millis(250)), point());
+        assert_eq!(
+            faster.sample(Duration::from_millis(516)),
             Point { x: 100.0, y: 99.0 }
         );
     }
